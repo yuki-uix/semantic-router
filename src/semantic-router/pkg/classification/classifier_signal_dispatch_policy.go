@@ -47,7 +47,7 @@ func (c *Classifier) buildPolicySignalDispatchers(
 		{
 			config.SignalTypePII, "PII",
 			func() {
-				c.evaluatePIISignal(
+				c.evaluatePIISignalWithToolResults(
 					requestFacts.Context,
 					results,
 					mu,

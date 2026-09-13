@@ -11,6 +11,11 @@ import (
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/observability/logging"
 )
 
+// PIIClassificationErrorType is the entity type a PII rule reports when its
+// content could not be fully classified and on_error is block. It mirrors the
+// fail-closed behavior of the jailbreak classifier.
+const PIIClassificationErrorType = "classification_error"
+
 // cachedPIIResult stores a cached PII token classification result.
 type cachedPIIResult struct {
 	result candle_binding.TokenClassificationResult
@@ -61,7 +66,11 @@ func (b *piiToolResultScanBudget) consumeInferenceCall() bool {
 	return true
 }
 
-func (c *Classifier) evaluatePIISignal(ctx context.Context, results *SignalResults, mu *sync.Mutex, piiText string, nonUserMessages []string, toolResultTexts []string, toolResultScanIncomplete bool) {
+func (c *Classifier) evaluatePIISignal(ctx context.Context, results *SignalResults, mu *sync.Mutex, piiText string, nonUserMessages []string) {
+	c.evaluatePIISignalWithToolResults(ctx, results, mu, piiText, nonUserMessages, nil, false)
+}
+
+func (c *Classifier) evaluatePIISignalWithToolResults(ctx context.Context, results *SignalResults, mu *sync.Mutex, piiText string, nonUserMessages []string, toolResultTexts []string, toolResultScanIncomplete bool) {
 	start := time.Now()
 
 	// Step 1: Collect the union of unique content pieces selected by all PII
@@ -150,9 +159,22 @@ func (c *Classifier) evaluatePIIRule(rule config.PIIRule, piiText string, nonUse
 		status = piiScanIncomplete
 	}
 	if status != piiScanClean {
-		c.recordPIIRuleError(rule, status, results, mu)
+		recordedStatus := status
+		// The remote-backend contract predates the request-budget distinction
+		// and exposes any partial legacy scan through pii_evaluation_failed.
+		// Tool-result scans retain the more precise incomplete code.
+		if rule.Source != config.PIISourceToolResult {
+			recordedStatus = piiScanFailed
+		}
+		c.recordPIIRuleError(rule, recordedStatus, results, mu)
 	}
 	deniedEntities := findDeniedEntities(entityTypes, rule.PIITypesAllowed)
+	errorDrivenMatch := false
+	if status != piiScanClean && c.Config.PIIModel.IsBlock() {
+		logging.Errorf("[Signal Computation] PII rule %q: content not fully classified; failing closed", rule.Name)
+		errorDrivenMatch = len(deniedEntities) == 0
+		deniedEntities = append(deniedEntities, PIIClassificationErrorType)
+	}
 
 	if len(deniedEntities) > 0 {
 		c.recordSignalExtraction(config.SignalTypePII, rule.Name, time.Since(start).Seconds())
@@ -163,6 +185,12 @@ func (c *Classifier) evaluatePIIRule(rule config.PIIRule, piiText string, nonUse
 		mu.Lock()
 		results.MatchedPIIRules = append(results.MatchedPIIRules, rule.Name)
 		results.PIIDetected = true
+		if errorDrivenMatch {
+			if results.SignalErrorMatches == nil {
+				results.SignalErrorMatches = make(map[string]bool)
+			}
+			results.SignalErrorMatches[signalConfidenceKey(config.SignalTypePII, rule.Name)] = true
+		}
 		for _, e := range deniedEntities {
 			if !slices.Contains(results.PIIEntities, e) {
 				results.PIIEntities = append(results.PIIEntities, e)
